@@ -304,28 +304,76 @@ if "last_parse_errors" not in st.session_state:
 
 
 # ==========================================
-# [6] 로그인
+# [6] 로그인 / 회원가입
 # ==========================================
 if not st.session_state.logged_in:
     st.title("🏃 아이도담 통합 관리 시스템")
 
-    login_id = st.text_input("아이디")
-    login_pw = st.text_input("비밀번호", type="password")
+    tab_login, tab_signup = st.tabs(["로그인", "선생님 회원가입"])
 
-    if st.button("로그인"):
-        users_df = st.session_state.users
-        match = users_df[users_df["userid"] == login_id]
+    with tab_login:
+        login_id = st.text_input("아이디", key="login_id")
+        login_pw = st.text_input("비밀번호", type="password", key="login_pw")
 
-        if match.empty:
-            st.error("존재하지 않는 아이디입니다.")
-        elif str(match.iloc[0]["password"]) != str(login_pw):
-            st.error("비밀번호가 일치하지 않습니다.")
-        elif str(match.iloc[0]["approved"]) == "No":
-            st.warning("원장님의 승인이 필요한 계정입니다.")
-        else:
-            st.session_state.logged_in = True
-            st.session_state.user_info = match.iloc[0].to_dict()
-            st.rerun()
+        if st.button("로그인", key="login_btn"):
+            users_df = st.session_state.users
+            match = users_df[users_df["userid"] == login_id]
+
+            if match.empty:
+                st.error("존재하지 않는 아이디입니다.")
+            elif str(match.iloc[0]["password"]) != str(login_pw):
+                st.error("비밀번호가 일치하지 않습니다.")
+            elif str(match.iloc[0]["approved"]) == "No":
+                st.warning("원장님의 승인이 필요한 계정입니다.")
+            else:
+                st.session_state.logged_in = True
+                st.session_state.user_info = match.iloc[0].to_dict()
+                st.rerun()
+
+    with tab_signup:
+        st.write("신규 선생님 계정을 등록합니다. 가입 후 원장님 승인 후 로그인할 수 있습니다.")
+
+        signup_name = st.text_input("이름", key="signup_name")
+        signup_id = st.text_input("아이디", key="signup_id")
+        signup_pw = st.text_input("비밀번호", type="password", key="signup_pw")
+        signup_pw_confirm = st.text_input("비밀번호 확인", type="password", key="signup_pw_confirm")
+
+        if st.button("회원가입 신청", key="signup_btn"):
+            users_df = st.session_state.users
+
+            signup_name = signup_name.strip()
+            signup_id = signup_id.strip()
+            signup_pw = signup_pw.strip()
+            signup_pw_confirm = signup_pw_confirm.strip()
+
+            if not signup_name:
+                st.error("이름을 입력해 주세요.")
+            elif not signup_id:
+                st.error("아이디를 입력해 주세요.")
+            elif not signup_pw:
+                st.error("비밀번호를 입력해 주세요.")
+            elif signup_pw != signup_pw_confirm:
+                st.error("비밀번호와 비밀번호 확인이 일치하지 않습니다.")
+            elif len(signup_pw) < 4:
+                st.error("비밀번호는 4자 이상 입력해 주세요.")
+            elif not users_df[users_df["userid"] == signup_id].empty:
+                st.error("이미 사용 중인 아이디입니다.")
+            else:
+                new_user = pd.DataFrame([{
+                    "userid": signup_id,
+                    "password": signup_pw,
+                    "name": signup_name,
+                    "role": "선생님",
+                    "approved": "No"
+                }])
+
+                st.session_state.users = pd.concat(
+                    [st.session_state.users, new_user],
+                    ignore_index=True
+                )
+                save_data(st.session_state.users, USER_FILE)
+
+                st.success("회원가입 신청이 완료되었습니다. 원장님 승인 후 로그인할 수 있습니다.")
 
     st.stop()
 
