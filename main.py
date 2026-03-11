@@ -14,6 +14,7 @@ INFO_URL_NEW = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwPFINd9ZeNRBtZ
 LOG_FILE = "attendance_log.csv"
 USER_FILE = "users.csv"
 PAYMENT_FILE = "payment_log.csv"
+PARKING_FILE = "parking_log.csv"
 
 DATE_FMT = "%Y-%m-%d"
 STATUS_OPTIONS = ["미체크", "출석", "결석", "보강", "일정변경"]
@@ -37,6 +38,8 @@ def load_data(file_path, columns):
         df = pd.read_csv(file_path)
         if "날짜" in df.columns:
             df["날짜"] = df["날짜"].apply(normalize_date)
+        if "수업일자" in df.columns:
+            df["수업일자"] = df["수업일자"].apply(normalize_date)
         return df
     except Exception as e:
         st.error(f"{file_path} 불러오기 실패: {e}")
@@ -73,30 +76,58 @@ def normalize_name_column(df):
 def clean_child_names(raw_value):
     """
     아동명 정제
+    - 빈칸, nan, -, 없음 등은 무시
     - 괄호 제거
     - 날짜 제거
     - / , + 구분자로 복수 이름 분리
+    - 실제 이름처럼 보이는 값만 남김
     """
     if pd.isna(raw_value):
         return []
 
     text = str(raw_value).strip()
-    if not text or text.lower() == "nan":
+    if not text:
+        return []
+
+    invalid_values = {
+        "nan", "none", "-", "--", "---", "없음", "없음.", "미정", "공란", "빈칸"
+    }
+    if text.lower() in invalid_values:
         return []
 
     text = re.sub(r"\(.*?\)", "", text)
     text = re.sub(r"\b\d{1,2}/\d{1,2}\b", "", text)
     text = re.sub(r"\s+", " ", text).strip()
 
+    if not text:
+        return []
+
     parts = re.split(r"[/,+]", text)
 
     names = []
     for p in parts:
         name = p.strip()
-        if name:
-            names.append(name)
+
+        if not name:
+            continue
+
+        if not re.search(r"[가-힣A-Za-z]", name):
+            continue
+
+        if len(name) < 2:
+            continue
+
+        names.append(name)
 
     return names
+
+
+def get_profile_value(row, candidates, default=""):
+    for col in candidates:
+        value = row.get(col)
+        if pd.notna(value) and str(value).strip():
+            return str(value).strip()
+    return default
 
 
 # ==========================================
@@ -267,6 +298,12 @@ if "payments" not in st.session_state:
         ["아동명", "수납상태", "금액", "결제일", "비고"]
     )
 
+if "parking" not in st.session_state:
+    st.session_state.parking = load_data(
+        PARKING_FILE,
+        ["등록일시", "수업일자", "아동명", "차량번호", "등록교사", "비고"]
+    )
+
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
@@ -307,7 +344,14 @@ if not st.session_state.logged_in:
 user = st.session_state.user_info
 is_admin = (user["userid"] == "ares855")
 
-menu_options = ["🏠 대시보드", "📝 오늘의 출석부", "💰 수납 관리", "🔍 아동 프로필"]
+menu_options = [
+    "🏠 대시보드",
+    "📝 오늘의 출석부",
+    "💰 수납 관리",
+    "🔍 아동 프로필",
+    "🚗 주차 등록",
+    "📋 출결 조회"
+]
 if is_admin:
     menu_options.append("⚙️ 관리자 및 디버그")
 
@@ -458,32 +502,7 @@ elif menu == "🔍 아동 프로필":
             if selected_child:
                 d = profiles[profiles["성명"] == selected_child].iloc[0]
 
-                contact_value = (
-                    d.get("보호자 연락처")
-                    or d.get("비상 연락처")
-                    or d.get("연락처")
-                    or "미기재"
-                )
-
-                caution_value = (
-                    d.get("신체 상태 및 주의사항")
-                    or d.get("주의사항")
-                    or d.get("건강상 주의사항")
-                    or "없음"
-                )
-
-                request_value = (
-                    d.get("담당 선생님께 바라는 부분")
-                    or d.get("선생님께 바라는 점")
-                    or d.get("기타 특이사항")
-                    or "내용 없음"
-                )
-
-                st.info(f"📞 보호자 연락처: {contact_value}")
-                st.error(f"⚠️ 주의사항: {caution_value}")
-                st.write(f"📝 선생님께 바라는 점: {request_value}")
-
-                with st.expander("원본 프로필 전체 보기"):
+                with st.expander("원본 프로필 전체 보기", expanded=True):
                     display_series = d.dropna()
                     st.dataframe(display_series.to_frame(name="내용"), use_container_width=True)
 
@@ -492,7 +511,122 @@ elif menu == "🔍 아동 프로필":
 
 
 # ==========================================
-# [12] 관리자 및 디버그
+# [12] 주차 등록
+# ==========================================
+elif menu == "🚗 주차 등록":
+    st.title("🚗 주차 등록")
+
+    try:
+        profiles = get_profiles()
+
+        if profiles.empty:
+            st.warning("프로필 데이터를 불러올 수 없습니다.")
+        else:
+            child_list = sorted(profiles["성명"].dropna().astype(str).str.strip().unique())
+
+            c1, c2 = st.columns([2, 1])
+            selected_child = c1.selectbox("아동 선택", child_list)
+            parking_date = c2.date_input("수업일자", date.today())
+
+            if selected_child:
+                d = profiles[profiles["성명"] == selected_child].iloc[0]
+
+                car_number = get_profile_value(
+                    d,
+                    ["이용하시는차량번호", "차량번호", "이용 차량번호", "보호자 차량번호"],
+                    default="미등록"
+                )
+
+                st.info(f"선택 아동: {selected_child}")
+                st.success(f"차량번호: {car_number}")
+
+                memo = st.text_input("비고", placeholder="예: 지하주차장 등록 완료")
+
+                if st.button("주차 등록 저장"):
+                    new_row = pd.DataFrame([{
+                        "등록일시": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "수업일자": parking_date.strftime(DATE_FMT),
+                        "아동명": selected_child,
+                        "차량번호": car_number,
+                        "등록교사": user["name"],
+                        "비고": memo
+                    }])
+
+                    st.session_state.parking = pd.concat(
+                        [st.session_state.parking, new_row],
+                        ignore_index=True
+                    )
+                    save_data(st.session_state.parking, PARKING_FILE)
+                    st.success("주차 등록이 저장되었습니다.")
+                    st.rerun()
+
+            st.subheader("최근 주차 등록 내역")
+            parking_view = st.session_state.parking.copy()
+
+            if not parking_view.empty:
+                parking_view["등록일시_dt"] = pd.to_datetime(parking_view["등록일시"], errors="coerce")
+                parking_view = parking_view.sort_values("등록일시_dt", ascending=False).drop(columns=["등록일시_dt"])
+                st.dataframe(parking_view.head(30), use_container_width=True)
+            else:
+                st.info("저장된 주차 등록 내역이 없습니다.")
+
+    except Exception as e:
+        st.error(f"주차 등록 기능 오류: {e}")
+
+
+# ==========================================
+# [13] 출결 조회
+# ==========================================
+elif menu == "📋 출결 조회":
+    st.title("📋 아동 출결 조회")
+
+    attendance_df = st.session_state.df.copy()
+
+    if attendance_df.empty:
+        st.info("출결 데이터가 없습니다.")
+    else:
+        child_candidates = sorted(attendance_df["아동명"].dropna().astype(str).str.strip().unique())
+
+        today = date.today()
+        start_default = today.replace(day=1)
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        selected_child = c1.selectbox("아동명 선택", child_candidates)
+        start_date = c2.date_input("조회 시작일", start_default)
+        end_date = c3.date_input("조회 종료일", today)
+
+        df_search = attendance_df.copy()
+        df_search["날짜_dt"] = pd.to_datetime(df_search["날짜"], errors="coerce")
+
+        mask = (
+            (df_search["아동명"].astype(str).str.strip() == selected_child) &
+            (df_search["날짜_dt"] >= pd.to_datetime(start_date)) &
+            (df_search["날짜_dt"] <= pd.to_datetime(end_date))
+        )
+
+        result_df = df_search[mask].copy()
+
+        st.subheader("조회 결과 요약")
+
+        a1, a2, a3, a4, a5 = st.columns(5)
+        a1.metric("전체", len(result_df))
+        a2.metric("출석", len(result_df[result_df["출결상태"] == "출석"]))
+        a3.metric("결석", len(result_df[result_df["출결상태"] == "결석"]))
+        a4.metric("보강", len(result_df[result_df["출결상태"] == "보강"]))
+        a5.metric("미체크/기타", len(result_df[~result_df["출결상태"].isin(["출석", "결석", "보강"]) ]))
+
+        if result_df.empty:
+            st.info("해당 기간에 조회된 출결 내역이 없습니다.")
+        else:
+            result_df = result_df.sort_values(by=["날짜_dt", "시간", "선생님"])
+            st.dataframe(
+                result_df[["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"]],
+                use_container_width=True
+            )
+
+
+# ==========================================
+# [14] 관리자 및 디버그
 # ==========================================
 elif menu == "⚙️ 관리자 및 디버그":
     st.title("🛠️ 관리자 및 디버그")
