@@ -56,9 +56,6 @@ def get_day_prefix(target_date):
 
 
 def normalize_name_column(df):
-    """
-    이름 컬럼을 '성명'으로 표준화
-    """
     candidate_cols = ["성명", "이름", "학생 이름", "아동명", "성함", "이용자명", "이름(성명)"]
 
     for col in candidate_cols:
@@ -110,10 +107,8 @@ def clean_child_names(raw_value):
 
         if not name:
             continue
-
         if not re.search(r"[가-힣A-Za-z]", name):
             continue
-
         if len(name) < 2:
             continue
 
@@ -166,7 +161,7 @@ def build_attendance_entries(target_date, df_sheet):
     아이도담 시간표 전용
     header=None 기준
     가정:
-    - 0행: 요일 블록 (월/화/수/목/금/토)
+    - 0행: 요일 블록
     - 1행: 선생님 이름
     - 2행 이후: 실제 수업 데이터
     - 0열: 시
@@ -179,8 +174,6 @@ def build_attendance_entries(target_date, df_sheet):
     date_str = target_date.strftime(DATE_FMT)
 
     df_sheet = df_sheet.copy()
-
-    # 첫 번째 열(시) 빈칸 채우기
     df_sheet.iloc[:, 0] = df_sheet.iloc[:, 0].ffill()
 
     day_row = df_sheet.iloc[0]
@@ -280,7 +273,6 @@ if "users" not in st.session_state:
         ["userid", "password", "name", "role", "approved"]
     )
 
-    # 운영 시 비밀번호 해시 저장 권장
     if st.session_state.users[st.session_state.users["userid"] == "ares855"].empty:
         admin_df = pd.DataFrame([{
             "userid": "ares855",
@@ -439,7 +431,6 @@ elif menu == "📝 오늘의 출석부":
                 new_note = c2.text_input("특이사항", value=note_value, key=f"note_{idx}")
 
                 if c3.button("저장", key=f"save_{idx}"):
-                    # 공동 수업 동기화
                     mask = (
                         (st.session_state.df["날짜"] == target_date_str) &
                         (st.session_state.df["시간"] == row["시간"]) &
@@ -522,43 +513,72 @@ elif menu == "🚗 주차 등록":
         if profiles.empty:
             st.warning("프로필 데이터를 불러올 수 없습니다.")
         else:
-            child_list = sorted(profiles["성명"].dropna().astype(str).str.strip().unique())
-
             c1, c2 = st.columns([2, 1])
-            selected_child = c1.selectbox("아동 선택", child_list)
+            search_name = c1.text_input("아동명 검색", placeholder="예: 김시윤")
             parking_date = c2.date_input("수업일자", date.today())
 
-            if selected_child:
-                d = profiles[profiles["성명"] == selected_child].iloc[0]
+            if search_name.strip():
+                profile_search = profiles.copy()
+                profile_search["성명"] = profile_search["성명"].fillna("").astype(str).str.strip()
 
-                car_number = get_profile_value(
-                    d,
-                    ["이용하시는차량번호", "차량번호", "이용 차량번호", "보호자 차량번호"],
-                    default="미등록"
-                )
+                matched = profile_search[
+                    profile_search["성명"].str.contains(search_name.strip(), na=False)
+                ].copy()
 
-                st.info(f"선택 아동: {selected_child}")
-                st.success(f"차량번호: {car_number}")
+                if matched.empty:
+                    st.warning("검색된 아동이 없습니다.")
+                else:
+                    st.subheader("검색 결과")
 
-                memo = st.text_input("비고", placeholder="예: 지하주차장 등록 완료")
+                    for idx, (_, row) in enumerate(matched.iterrows()):
+                        child_name = str(row["성명"]).strip()
 
-                if st.button("주차 등록 저장"):
-                    new_row = pd.DataFrame([{
-                        "등록일시": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "수업일자": parking_date.strftime(DATE_FMT),
-                        "아동명": selected_child,
-                        "차량번호": car_number,
-                        "등록교사": user["name"],
-                        "비고": memo
-                    }])
+                        car_number = get_profile_value(
+                            row,
+                            [
+                                "8. 이용하시는 차량번호 (센터 이용 시 필요한 경우에만 기재해 주세요.)",
+                                "이용하시는차량번호",
+                                "차량번호",
+                                "이용 차량번호",
+                                "보호자 차량번호"
+                            ],
+                            default=""
+                        )
 
-                    st.session_state.parking = pd.concat(
-                        [st.session_state.parking, new_row],
-                        ignore_index=True
-                    )
-                    save_data(st.session_state.parking, PARKING_FILE)
-                    st.success("주차 등록이 저장되었습니다.")
-                    st.rerun()
+                        with st.expander(f"{child_name}", expanded=True):
+                            st.write(f"아동명: {child_name}")
+
+                            edited_car_number = st.text_input(
+                                "차량번호",
+                                value=car_number,
+                                key=f"car_number_{idx}"
+                            )
+
+                            memo = st.text_input(
+                                "비고",
+                                key=f"parking_memo_{idx}",
+                                placeholder="예: 주차시스템 등록 완료"
+                            )
+
+                            c_save1, c_save2 = st.columns([1, 3])
+
+                            if c_save1.button("저장", key=f"parking_save_{idx}"):
+                                new_row = pd.DataFrame([{
+                                    "등록일시": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "수업일자": parking_date.strftime(DATE_FMT),
+                                    "아동명": child_name,
+                                    "차량번호": edited_car_number.strip(),
+                                    "등록교사": user["name"],
+                                    "비고": memo
+                                }])
+
+                                st.session_state.parking = pd.concat(
+                                    [st.session_state.parking, new_row],
+                                    ignore_index=True
+                                )
+                                save_data(st.session_state.parking, PARKING_FILE)
+                                st.success("주차 등록이 저장되었습니다.")
+                                st.rerun()
 
             st.subheader("최근 주차 등록 내역")
             parking_view = st.session_state.parking.copy()
@@ -585,44 +605,46 @@ elif menu == "📋 출결 조회":
     if attendance_df.empty:
         st.info("출결 데이터가 없습니다.")
     else:
-        child_candidates = sorted(attendance_df["아동명"].dropna().astype(str).str.strip().unique())
-
         today = date.today()
         start_default = today.replace(day=1)
 
         c1, c2, c3 = st.columns([2, 1, 1])
-        selected_child = c1.selectbox("아동명 선택", child_candidates)
+        search_name = c1.text_input("아동명 검색", placeholder="예: 김시윤")
         start_date = c2.date_input("조회 시작일", start_default)
         end_date = c3.date_input("조회 종료일", today)
 
-        df_search = attendance_df.copy()
-        df_search["날짜_dt"] = pd.to_datetime(df_search["날짜"], errors="coerce")
+        if search_name.strip():
+            df_search = attendance_df.copy()
+            df_search["아동명"] = df_search["아동명"].fillna("").astype(str).str.strip()
+            df_search["날짜_dt"] = pd.to_datetime(df_search["날짜"], errors="coerce")
 
-        mask = (
-            (df_search["아동명"].astype(str).str.strip() == selected_child) &
-            (df_search["날짜_dt"] >= pd.to_datetime(start_date)) &
-            (df_search["날짜_dt"] <= pd.to_datetime(end_date))
-        )
-
-        result_df = df_search[mask].copy()
-
-        st.subheader("조회 결과 요약")
-
-        a1, a2, a3, a4, a5 = st.columns(5)
-        a1.metric("전체", len(result_df))
-        a2.metric("출석", len(result_df[result_df["출결상태"] == "출석"]))
-        a3.metric("결석", len(result_df[result_df["출결상태"] == "결석"]))
-        a4.metric("보강", len(result_df[result_df["출결상태"] == "보강"]))
-        a5.metric("미체크/기타", len(result_df[~result_df["출결상태"].isin(["출석", "결석", "보강"]) ]))
-
-        if result_df.empty:
-            st.info("해당 기간에 조회된 출결 내역이 없습니다.")
-        else:
-            result_df = result_df.sort_values(by=["날짜_dt", "시간", "선생님"])
-            st.dataframe(
-                result_df[["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"]],
-                use_container_width=True
+            mask = (
+                (df_search["아동명"].str.contains(search_name.strip(), na=False)) &
+                (df_search["날짜_dt"] >= pd.to_datetime(start_date)) &
+                (df_search["날짜_dt"] <= pd.to_datetime(end_date))
             )
+
+            result_df = df_search[mask].copy()
+
+            st.subheader("조회 결과 요약")
+
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a1.metric("전체", len(result_df))
+            a2.metric("출석", len(result_df[result_df["출결상태"] == "출석"]))
+            a3.metric("결석", len(result_df[result_df["출결상태"] == "결석"]))
+            a4.metric("보강", len(result_df[result_df["출결상태"] == "보강"]))
+            a5.metric("미체크/기타", len(result_df[~result_df["출결상태"].isin(["출석", "결석", "보강"])]))
+
+            if result_df.empty:
+                st.info("해당 기간에 조회된 출결 내역이 없습니다.")
+            else:
+                result_df = result_df.sort_values(by=["날짜_dt", "시간", "선생님"])
+                st.dataframe(
+                    result_df[["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"]],
+                    use_container_width=True
+                )
+        else:
+            st.info("아동명을 입력하면 출결 내역을 조회할 수 있습니다.")
 
 
 # ==========================================
