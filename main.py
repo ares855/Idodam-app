@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import os
 import re
-from datetime import date, datetime
+from datetime import date
 
 # ==========================================
-# [1] 데이터 연동 주소 (03월 시트 최적화)
+# [1] 기본 설정
 # ==========================================
 SCHEDULE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRDw87NcOVP_WZInl7qmTqfPvFoBr-u4fo95Uoi9rbVo0Dc_puMUTQTa5vMs2yYqqsKFzQ-1tWQdtt4/pub?output=csv"
 INFO_URL_EXISTING = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTRtoi3NAX4rUW297nOdfO3XPxCM9GiH1mS0MwO3P-nzrrZZl7x_3AT2JWcBMgFGvTA90XB7_1busOj/pub?output=csv"
@@ -15,172 +15,555 @@ LOG_FILE = "attendance_log.csv"
 USER_FILE = "users.csv"
 PAYMENT_FILE = "payment_log.csv"
 
-STATUS_OPTIONS = ["미체크", "출석", "결석", "보강", "일정변경"]
-TEACHERS_LIST = ["김동규", "한다현", "김희애", "장은비", "정진규", "김은정"]
 DATE_FMT = "%Y-%m-%d"
+STATUS_OPTIONS = ["미체크", "출석", "결석", "보강", "일정변경"]
+
 
 # ==========================================
-# [2] 지능형 데이터 처리 엔진
+# [2] 공통 유틸
 # ==========================================
+def normalize_date(value):
+    try:
+        return pd.to_datetime(value).strftime(DATE_FMT)
+    except Exception:
+        return ""
+
 
 def load_data(file_path, columns):
     if not os.path.exists(file_path):
         return pd.DataFrame(columns=columns)
+
     try:
         df = pd.read_csv(file_path)
         if "날짜" in df.columns:
-            df["날짜"] = pd.to_datetime(df["날짜"]).dt.strftime(DATE_FMT)
+            df["날짜"] = df["날짜"].apply(normalize_date)
         return df
-    except: return pd.DataFrame(columns=columns)
+    except Exception as e:
+        st.error(f"{file_path} 불러오기 실패: {e}")
+        return pd.DataFrame(columns=columns)
+
 
 def save_data(df, file_path):
     df.to_csv(file_path, index=False, encoding="utf-8-sig")
 
-def clean_and_split_names(raw_value):
+
+def get_day_prefix(target_date):
+    days_kor = ["월", "화", "수", "목", "금", "토", "일"]
+    return days_kor[target_date.weekday()]
+
+
+def normalize_name_column(df):
     """
-    '허윤혁(16)박지우(16)' 또는 '김민채\n이예진' 형태를 분리하여 
-    깨끗한 이름 리스트(['허윤혁', '박지우'])로 반환
+    이름 컬럼을 '성명'으로 표준화
     """
-    if pd.isna(raw_value) or str(raw_value).strip() in ['', 'nan']: return []
-    text = str(raw_value)
-    # 1. 괄호와 그 안의 내용(나이 등) 모두 제거
-    text = re.sub(r"\(.*?\)", " ", text)
-    # 2. 한글 이름(2~4자)만 모두 찾아내기
-    names = re.findall(r'[가-힣]{2,4}', text)
-    return [n.strip() for n in names if n.strip()]
+    candidate_cols = ["성명", "이름", "학생 이름", "아동명", "성함", "이용자명", "이름(성명)"]
+
+    for col in candidate_cols:
+        if col in df.columns:
+            return df.rename(columns={col: "성명"})
+
+    for col in df.columns:
+        col_str = str(col).strip()
+        if any(keyword in col_str for keyword in ["성명", "이름", "아동"]):
+            return df.rename(columns={col: "성명"})
+
+    raise ValueError(f"이름 컬럼을 찾을 수 없습니다. 현재 컬럼: {list(df.columns)}")
+
+
+def clean_child_names(raw_value):
+    """
+    아동명 정제
+    - 괄호 제거
+    - 날짜 제거
+    - / , + 구분자로 복수 이름 분리
+    """
+    if pd.isna(raw_value):
+        return []
+
+    text = str(raw_value).strip()
+    if not text or text.lower() == "nan":
+        return []
+
+    text = re.sub(r"\(.*?\)", "", text)
+    text = re.sub(r"\b\d{1,2}/\d{1,2}\b", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    parts = re.split(r"[/,+]", text)
+
+    names = []
+    for p in parts:
+        name = p.strip()
+        if name:
+            names.append(name)
+
+    return names
+
 
 # ==========================================
-# [3] 시간표 시트 분석 로직 (2단 헤더 대응)
+# [3] 외부 데이터 가져오기
 # ==========================================
-
 @st.cache_data(ttl=60)
-def fetch_sheet(url):
+def fetch_sheet(url, header="infer"):
+    if header is None:
+        return pd.read_csv(url, header=None)
     return pd.read_csv(url)
 
-def build_attendance_from_complex_sheet(target_date, df_raw):
+
+@st.cache_data(ttl=60)
+def fetch_profile_sheets():
+    df1 = pd.read_csv(INFO_URL_EXISTING)
+    df2 = pd.read_csv(INFO_URL_NEW)
+    return df1, df2
+
+
+def get_profiles():
+    df1, df2 = fetch_profile_sheets()
+    df1 = normalize_name_column(df1)
+    df2 = normalize_name_column(df2)
+
+    profiles = pd.concat([df1, df2], ignore_index=True, sort=False)
+    profiles["성명"] = profiles["성명"].fillna("").astype(str).str.strip()
+    profiles = profiles[profiles["성명"] != ""]
+    return profiles
+
+
+# ==========================================
+# [4] 아이도담 시간표 전용 파서
+# ==========================================
+def build_attendance_entries(target_date, df_sheet):
     """
-    원장님의 2단 헤더(요일-선생님) 및 시/분 분리 구조를 해석
+    아이도담 시간표 전용
+    header=None 기준
+    가정:
+    - 0행: 요일 블록 (월/화/수/목/금/토)
+    - 1행: 선생님 이름
+    - 2행 이후: 실제 수업 데이터
+    - 0열: 시
+    - 1열: 분
     """
-    days_kor = ["월", "화", "수", "목", "금", "토", "일"]
-    today_prefix = days_kor[target_date.weekday()]
+    if df_sheet.empty or df_sheet.shape[0] < 3:
+        raise ValueError("시간표 데이터가 너무 짧습니다. 최소 3행 이상 필요합니다.")
+
+    day_prefix = get_day_prefix(target_date)
     date_str = target_date.strftime(DATE_FMT)
-    
-    # 헤더 분석 (Row 0: 요일, Row 1: 선생님)
-    days_row = df_raw.iloc[0].ffill() # 요일 정보를 오른쪽으로 채움
-    teachers_row = df_raw.iloc[1]
-    
-    # 시간 정보 채우기 (A열 '시' 정보를 아래로 채움)
-    df_raw.iloc[2:, 0] = df_raw.iloc[2:, 0].ffill()
-    
+
+    df_sheet = df_sheet.copy()
+
+    # 첫 번째 열(시) 빈칸 채우기
+    df_sheet.iloc[:, 0] = df_sheet.iloc[:, 0].ffill()
+
+    day_row = df_sheet.iloc[0]
+    teacher_row = df_sheet.iloc[1]
+    body = df_sheet.iloc[2:].copy()
+
+    today_cols = []
+    current_day = None
+
+    for col_idx in range(df_sheet.shape[1]):
+        top_value = str(day_row.iloc[col_idx]).strip()
+
+        if top_value and top_value.lower() != "nan":
+            current_day = top_value
+
+        if current_day == day_prefix:
+            today_cols.append(col_idx)
+
+    if not today_cols:
+        raise ValueError(f"{day_prefix}요일 컬럼 블록을 찾지 못했습니다. 시간표 원본 구조를 다시 확인해 주세요.")
+
     new_entries = []
-    
-    # 오늘 요일에 맞는 선생님 열 찾기
-    for col_idx in range(len(df_raw.columns)):
-        day_val = str(days_row.iloc[col_idx]).strip()
-        teacher_val = str(teachers_row.iloc[col_idx]).strip()
-        
-        if day_val == today_prefix and teacher_val in TEACHERS_LIST:
-            # 해당 열의 데이터 스캔 (3번째 줄부터)
-            for row_idx in range(2, len(df_raw)):
-                row = df_raw.iloc[row_idx]
-                cell_val = row.iloc[col_idx]
-                
-                # 이름 추출
-                names = clean_and_split_names(cell_val)
-                if not names: continue
-                
-                # 시간 조합
-                try:
-                    h = str(row.iloc[0]).replace("시", "").strip().zfill(2)
-                    m = str(row.iloc[1]).replace("분", "").strip().zfill(2)
-                    time_str = f"{h}:{m}"
-                    
-                    for name in names:
-                        new_entries.append({
-                            "날짜": date_str, "요일": f"{today_prefix}요일", "시간": time_str,
-                            "선생님": teacher_val, "아동명": name, "출결상태": "미체크", "특이사항": ""
-                        })
-                except: continue
-                
-    return pd.DataFrame(new_entries)
+    parse_errors = []
+
+    for col_idx in today_cols:
+        if col_idx < 2:
+            continue
+
+        teacher_name = str(teacher_row.iloc[col_idx]).strip()
+        if not teacher_name or teacher_name.lower() == "nan":
+            continue
+
+        for row_idx, row in body.iterrows():
+            child_raw = row.iloc[col_idx]
+            children = clean_child_names(child_raw)
+
+            if not children:
+                continue
+
+            hour_raw = row.iloc[0]
+            minute_raw = row.iloc[1]
+
+            try:
+                hour_text = str(hour_raw).replace("시", "").strip()
+                minute_text = str(minute_raw).replace("분", "").strip()
+
+                hour = str(int(float(hour_text))).zfill(2)
+                minute = str(int(float(minute_text))).zfill(2)
+                time_str = f"{hour}:{minute}"
+            except Exception as e:
+                parse_errors.append(f"행 {row_idx + 1}, 열 {col_idx}, 교사 {teacher_name}: {e}")
+                continue
+
+            for child_name in children:
+                new_entries.append({
+                    "날짜": date_str,
+                    "요일": f"{day_prefix}요일",
+                    "시간": time_str,
+                    "선생님": teacher_name,
+                    "아동명": child_name,
+                    "출결상태": "미체크",
+                    "특이사항": ""
+                })
+
+    return pd.DataFrame(new_entries), parse_errors
+
+
+def merge_new_schedule(existing_df, new_df):
+    key_cols = ["날짜", "시간", "선생님", "아동명"]
+
+    if new_df.empty:
+        return existing_df, 0
+
+    if existing_df.empty:
+        merged = pd.concat([existing_df, new_df], ignore_index=True)
+        return merged, len(new_df)
+
+    existing_keys = set(existing_df[key_cols].apply(tuple, axis=1))
+    new_only = new_df[~new_df[key_cols].apply(tuple, axis=1).isin(existing_keys)].copy()
+
+    merged = pd.concat([existing_df, new_only], ignore_index=True)
+    return merged, len(new_only)
+
 
 # ==========================================
-# [4] 메인 UI 및 시스템 로직
+# [5] 세션 초기화
 # ==========================================
+if "df" not in st.session_state:
+    st.session_state.df = load_data(
+        LOG_FILE,
+        ["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"]
+    )
 
-# 세션 및 로그인 초기화 (기존 로직 동일)
-if "df" not in st.session_state: st.session_state.df = load_data(LOG_FILE, ["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"])
 if "users" not in st.session_state:
-    st.session_state.users = load_data(USER_FILE, ["userid", "password", "name", "role", "approved"])
-    if st.session_state.users[st.session_state.users["userid"] == "ares855"].empty:
-        admin = pd.DataFrame([{"userid": "ares855", "password": "Kimdongkyu1!", "name": "김동규", "role": "관리자", "approved": "Yes"}])
-        st.session_state.users = pd.concat([st.session_state.users, admin], ignore_index=True)
-        save_data(st.session_state.users, USER_FILE)
-if "logged_in" not in st.session_state: st.session_state.logged_in = False
+    st.session_state.users = load_data(
+        USER_FILE,
+        ["userid", "password", "name", "role", "approved"]
+    )
 
+    # 운영 시 비밀번호 해시 저장 권장
+    if st.session_state.users[st.session_state.users["userid"] == "ares855"].empty:
+        admin_df = pd.DataFrame([{
+            "userid": "ares855",
+            "password": "Kimdongkyu1!",
+            "name": "김동규",
+            "role": "관리자",
+            "approved": "Yes"
+        }])
+        st.session_state.users = pd.concat([st.session_state.users, admin_df], ignore_index=True)
+        save_data(st.session_state.users, USER_FILE)
+
+if "payments" not in st.session_state:
+    st.session_state.payments = load_data(
+        PAYMENT_FILE,
+        ["아동명", "수납상태", "금액", "결제일", "비고"]
+    )
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "last_parse_errors" not in st.session_state:
+    st.session_state["last_parse_errors"] = []
+
+
+# ==========================================
+# [6] 로그인
+# ==========================================
 if not st.session_state.logged_in:
     st.title("🏃 아이도담 통합 관리 시스템")
-    li_id = st.text_input("아이디")
-    li_pw = st.text_input("비밀번호", type="password")
+
+    login_id = st.text_input("아이디")
+    login_pw = st.text_input("비밀번호", type="password")
+
     if st.button("로그인"):
-        match = st.session_state.users[st.session_state.users["userid"] == li_id]
-        if not match.empty and str(match.iloc[0]["password"]) == str(li_pw):
+        users_df = st.session_state.users
+        match = users_df[users_df["userid"] == login_id]
+
+        if match.empty:
+            st.error("존재하지 않는 아이디입니다.")
+        elif str(match.iloc[0]["password"]) != str(login_pw):
+            st.error("비밀번호가 일치하지 않습니다.")
+        elif str(match.iloc[0]["approved"]) == "No":
+            st.warning("원장님의 승인이 필요한 계정입니다.")
+        else:
             st.session_state.logged_in = True
             st.session_state.user_info = match.iloc[0].to_dict()
             st.rerun()
+
     st.stop()
 
+
+# ==========================================
+# [7] 메뉴
+# ==========================================
 user = st.session_state.user_info
-menu = st.sidebar.radio("메뉴", ["🏠 대시보드", "📝 오늘의 출석부", "💰 수납 관리", "🔍 아동 프로필", "⚙️ 관리자 및 디버그"])
+is_admin = (user["userid"] == "ares855")
 
-# --- [메뉴 1] 출석부 기능 ---
-if menu == "📝 오늘의 출석부":
-    st.header(f"📅 {user['name']} 선생님 출석부")
-    t_date = st.date_input("날짜 선택", date.today())
-    t_date_str = t_date.strftime(DATE_FMT)
+menu_options = ["🏠 대시보드", "📝 오늘의 출석부", "💰 수납 관리", "🔍 아동 프로필"]
+if is_admin:
+    menu_options.append("⚙️ 관리자 및 디버그")
 
-    if st.button("🔄 구글 시트에서 새 스케줄 가져오기"):
-        try:
-            raw_sheet = fetch_sheet(SCHEDULE_URL)
-            new_df = build_attendance_from_complex_sheet(t_date, raw_sheet)
-            
-            # 기존 기록 보호 (중복 체크)
-            if not st.session_state.df.empty:
-                key_cols = ["날짜", "시간", "선생님", "아동명"]
-                existing_keys = set(st.session_state.df[key_cols].apply(tuple, axis=1))
-                new_only = new_df[~new_df[key_cols].apply(tuple, axis=1).isin(existing_keys)]
-            else: new_only = new_df
+menu = st.sidebar.radio("메뉴 선택", menu_options)
 
-            st.session_state.df = pd.concat([st.session_state.df, new_only], ignore_index=True)
-            save_data(st.session_state.df, LOG_FILE)
-            st.success(f"{len(new_only)}개의 수업이 새로 추가되었습니다.")
-            st.rerun()
-        except Exception as e: st.error(f"연동 실패: {e}")
 
-    # 출석부 명단 표시
-    v_df = st.session_state.df[(st.session_state.df["선생님"] == user["name"]) & (st.session_state.df["날짜"] == t_date_str)].copy()
-    if v_df.empty: st.info("등록된 수업이 없습니다.")
+# ==========================================
+# [8] 대시보드
+# ==========================================
+if menu == "🏠 대시보드":
+    st.title("🏃 아이도담 대시보드")
+
+    today_str = date.today().strftime(DATE_FMT)
+    today_df = st.session_state.df[st.session_state.df["날짜"] == today_str]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("오늘 수업", len(today_df))
+    c2.metric("출석", len(today_df[today_df["출결상태"] == "출석"]))
+    c3.metric("미체크", len(today_df[today_df["출결상태"] == "미체크"]))
+
+    st.subheader("오늘 수업 현황")
+    if not today_df.empty:
+        st.dataframe(today_df.sort_values(by=["시간", "선생님", "아동명"]), use_container_width=True)
     else:
-        for idx, row in v_df.sort_values("시간").iterrows():
+        st.info("오늘 등록된 수업이 없습니다.")
+
+
+# ==========================================
+# [9] 오늘의 출석부
+# ==========================================
+elif menu == "📝 오늘의 출석부":
+    st.header(f"📅 {user['name']} 선생님 출석부")
+
+    target_date = st.date_input("날짜 선택", date.today())
+    target_date_str = target_date.strftime(DATE_FMT)
+
+    if st.button("🔄 구글 시트에서 새 스케줄 동기화"):
+        try:
+            raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+            new_df, parse_errors = build_attendance_entries(target_date, raw_sheet)
+
+            merged_df, added_count = merge_new_schedule(st.session_state.df, new_df)
+            st.session_state.df = merged_df
+            save_data(st.session_state.df, LOG_FILE)
+
+            st.session_state["last_parse_errors"] = parse_errors
+
+            if added_count > 0:
+                st.success(f"{added_count}개의 새 수업을 추가했습니다.")
+            else:
+                st.info("새로 추가된 수업이 없습니다.")
+
+            if parse_errors:
+                st.warning(f"시간 파싱 실패 {len(parse_errors)}건이 있습니다. 관리자 디버그 탭에서 확인하세요.")
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"시간표 동기화 실패: {e}")
+
+    view_df = st.session_state.df[
+        (st.session_state.df["선생님"] == user["name"]) &
+        (st.session_state.df["날짜"] == target_date_str)
+    ].copy()
+
+    if view_df.empty:
+        st.info("등록된 수업이 없습니다.")
+    else:
+        view_df["정렬시간"] = pd.to_datetime(view_df["시간"], format="%H:%M", errors="coerce")
+        view_df = view_df.sort_values(by=["정렬시간", "아동명"])
+
+        for idx, row in view_df.iterrows():
             with st.expander(f"[{row['시간']}] {row['아동명']} ({row['출결상태']})"):
                 c1, c2, c3 = st.columns([2, 5, 1])
-                ns = c1.selectbox("상태", STATUS_OPTIONS, index=STATUS_OPTIONS.index(row["출결상태"]), key=f"s{idx}")
-                nt = c2.text_input("특이사항", value=str(row["특이사항"]) if pd.notna(row["특이사항"]) else "", key=f"n{idx}")
-                if c3.button("저장", key=f"b{idx}"):
-                    # 그룹 수업 실시간 동기화 (시간/아동명이 같으면 전체 업데이트)
-                    mask = (st.session_state.df["날짜"] == t_date_str) & (st.session_state.df["시간"] == row["시간"]) & (st.session_state.df["아동명"] == row["아동명"])
-                    st.session_state.df.loc[mask, ["출결상태", "특이사항"]] = [ns, nt]
-                    save_data(st.session_state.df, LOG_FILE); st.success("완료"); st.rerun()
 
-# --- [메뉴 2] 아동 프로필 조회 ---
+                current_status = row["출결상태"] if row["출결상태"] in STATUS_OPTIONS else "미체크"
+                new_status = c1.selectbox(
+                    "상태",
+                    STATUS_OPTIONS,
+                    index=STATUS_OPTIONS.index(current_status),
+                    key=f"status_{idx}"
+                )
+
+                note_value = "" if pd.isna(row["특이사항"]) else str(row["특이사항"])
+                new_note = c2.text_input("특이사항", value=note_value, key=f"note_{idx}")
+
+                if c3.button("저장", key=f"save_{idx}"):
+                    # 공동 수업 동기화
+                    mask = (
+                        (st.session_state.df["날짜"] == target_date_str) &
+                        (st.session_state.df["시간"] == row["시간"]) &
+                        (st.session_state.df["아동명"] == row["아동명"])
+                    )
+                    st.session_state.df.loc[mask, ["출결상태", "특이사항"]] = [new_status, new_note]
+                    save_data(st.session_state.df, LOG_FILE)
+                    st.success("저장되었습니다.")
+                    st.rerun()
+
+
+# ==========================================
+# [10] 수납 관리
+# ==========================================
+elif menu == "💰 수납 관리":
+    st.title("💰 수납 현황 관리")
+
+    if is_admin:
+        with st.expander("수납 파일 업로드"):
+            up_file = st.file_uploader("엑셀 또는 CSV 업로드", type=["xlsx", "csv"])
+            if up_file is not None:
+                try:
+                    if up_file.name.endswith(".xlsx"):
+                        payment_df = pd.read_excel(up_file)
+                    else:
+                        payment_df = pd.read_csv(up_file)
+
+                    st.session_state.payments = payment_df
+                    save_data(payment_df, PAYMENT_FILE)
+                    st.success("수납 데이터가 업데이트되었습니다.")
+                except Exception as e:
+                    st.error(f"수납 파일 처리 실패: {e}")
+
+    search_name = st.text_input("아동명 검색")
+    display_df = st.session_state.payments.copy()
+
+    if "아동명" in display_df.columns:
+        display_df["아동명"] = display_df["아동명"].fillna("").astype(str)
+        if search_name:
+            display_df = display_df[display_df["아동명"].str.contains(search_name, na=False)]
+
+    st.dataframe(display_df, use_container_width=True)
+
+
+# ==========================================
+# [11] 아동 프로필
+# ==========================================
 elif menu == "🔍 아동 프로필":
-    st.title("📂 아동 상세 정보")
-    # ... (신상카드 연동 로직 동일) ...
+    st.title("📂 아동 상세 프로필")
 
-# --- [메뉴 3] 관리자 디버그 ---
+    try:
+        profiles = get_profiles()
+
+        if profiles.empty:
+            st.warning("불러온 프로필 데이터가 없습니다.")
+        else:
+            child_list = sorted(profiles["성명"].dropna().astype(str).str.strip().unique())
+            selected_child = st.selectbox("아동 선택", child_list)
+
+            if selected_child:
+                d = profiles[profiles["성명"] == selected_child].iloc[0]
+
+                contact_value = (
+                    d.get("보호자 연락처")
+                    or d.get("비상 연락처")
+                    or d.get("연락처")
+                    or "미기재"
+                )
+
+                caution_value = (
+                    d.get("신체 상태 및 주의사항")
+                    or d.get("주의사항")
+                    or d.get("건강상 주의사항")
+                    or "없음"
+                )
+
+                request_value = (
+                    d.get("담당 선생님께 바라는 부분")
+                    or d.get("선생님께 바라는 점")
+                    or d.get("기타 특이사항")
+                    or "내용 없음"
+                )
+
+                st.info(f"📞 보호자 연락처: {contact_value}")
+                st.error(f"⚠️ 주의사항: {caution_value}")
+                st.write(f"📝 선생님께 바라는 점: {request_value}")
+
+                with st.expander("원본 프로필 전체 보기"):
+                    display_series = d.dropna()
+                    st.dataframe(display_series.to_frame(name="내용"), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"신상 정보 로딩 실패: {e}")
+
+
+# ==========================================
+# [12] 관리자 및 디버그
+# ==========================================
 elif menu == "⚙️ 관리자 및 디버그":
-    st.title("🛠️ 시스템 진단")
-    if st.button("현재 구글 시트 컬럼 및 상단 데이터 확인"):
-        test_df = fetch_sheet(SCHEDULE_URL)
-        st.write("컬럼 목록:", test_df.columns.tolist())
-        st.dataframe(test_df.head(10))
+    st.title("🛠️ 관리자 및 디버그")
+
+    tab1, tab2, tab3 = st.tabs(["가입 승인", "데이터 진단", "사용자 목록"])
+
+    with tab1:
+        st.subheader("가입 승인")
+        pending = st.session_state.users[st.session_state.users["approved"] == "No"]
+
+        if pending.empty:
+            st.info("승인 대기 계정이 없습니다.")
+        else:
+            for i, u in pending.iterrows():
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"{u['name']} ({u['userid']})")
+                if c2.button("승인", key=f"approve_{i}"):
+                    st.session_state.users.at[i, "approved"] = "Yes"
+                    save_data(st.session_state.users, USER_FILE)
+                    st.success(f"{u['name']} 계정을 승인했습니다.")
+                    st.rerun()
+
+    with tab2:
+        st.subheader("실시간 데이터 진단")
+
+        if st.button("시간표 시트 구조 확인"):
+            try:
+                raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+                st.write("시간표 shape:", raw_sheet.shape)
+                st.dataframe(raw_sheet.head(10), use_container_width=True)
+            except Exception as e:
+                st.error(f"시간표 시트 확인 실패: {e}")
+
+        if st.button("오늘 요일 파싱 결과 확인"):
+            try:
+                raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+                parsed_df, parse_errors = build_attendance_entries(date.today(), raw_sheet)
+
+                st.write("파싱된 수업 개수:", len(parsed_df))
+                st.dataframe(parsed_df.head(30), use_container_width=True)
+
+                if parse_errors:
+                    st.warning(f"파싱 실패 {len(parse_errors)}건")
+                    st.write(parse_errors[:20])
+                else:
+                    st.success("파싱 실패 없음")
+
+            except Exception as e:
+                st.error(f"파싱 확인 실패: {e}")
+
+        if st.button("신상카드 시트 구조 확인"):
+            try:
+                df1, df2 = fetch_profile_sheets()
+
+                st.write("기존 신상카드 컬럼:", df1.columns.tolist())
+                st.dataframe(df1.head(5), use_container_width=True)
+
+                st.write("신규 신상카드 컬럼:", df2.columns.tolist())
+                st.dataframe(df2.head(5), use_container_width=True)
+
+            except Exception as e:
+                st.error(f"신상카드 진단 실패: {e}")
+
+        if st.button("캐시 새로고침"):
+            st.cache_data.clear()
+            st.success("캐시를 비웠습니다.")
+
+        if st.session_state["last_parse_errors"]:
+            st.subheader("최근 동기화 파싱 실패 내역")
+            st.write(st.session_state["last_parse_errors"][:30])
+
+    with tab3:
+        st.subheader("사용자 목록")
+        st.dataframe(st.session_state.users, use_container_width=True)
